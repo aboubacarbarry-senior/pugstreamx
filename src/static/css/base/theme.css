@@ -1,0 +1,7 @@
+/* Design tokens other than colors (those live in color.css). Imported by src/app/globals.css after
+   Tailwind, so @theme values become utilities (e.g. font-sans). */
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}

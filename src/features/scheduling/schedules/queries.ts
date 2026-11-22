@@ -1,0 +1,219 @@
+import "server-only";
+import { randomInt } from "node:crypto";
+import { MongoServerError, ObjectId } from "mongodb";
+import { avatarUrl } from "@/features/account/profile/constants";
+import type { UserDoc } from "@/features/account/users/types";
+import { getCollection } from "@/lib/db/client";
+import { ROLES } from "@/features/account/users/roles";
+import { PM_COLORS, SCHEDULE_UID_PATTERN } from "./constants";
+import type { LinkedSchedule, Schedule, ScheduleDoc, ScheduleOwner } from "./types";
+
+// Every read is for one group's calendar (`groupId`); callers decide access (access.ts).
+
+/** A schedule's linked IDs, reading the earlier single `linkedUid` too. */
+export function linkedUidsOf(doc: ScheduleDoc): string[] {
+  return doc.linkedUids ?? (doc.linkedUid ? [doc.linkedUid] : []);
+}
+
+/**
+ * How to read schedules for a viewer. `techSupportOnly` (Developers, `techSupportOnly(access)`):
+ * only those that need a tech supporter. `viewerId`: sets `Schedule.mine` on the ones they made.
+ */
+export type ScheduleReadOptions = { techSupportOnly?: boolean; viewerId?: ObjectId | null };
+
+export function toSchedule(
+  doc: ScheduleDoc,
+  linked: LinkedSchedule[] = [],
+  profileManager: ScheduleOwner | null = null,
+  viewerId: ObjectId | null = null,
+): Schedule {
+  return {
+    id: doc._id.toHexString(),
+    uid: doc.uid,
+    title: doc.title,
+    start: doc.start.toISOString(),
+    end: doc.end.toISOString(),
+    timeZone: doc.timeZone ?? null,
+    clientCompany: doc.clientCompany,
+    interviewer: doc.interviewer,
+    meetingUrl: doc.meetingUrl ?? null,
+    resumeUrl: doc.resumeUrl,
+    jobDescriptionUrl: doc.jobDescriptionUrl,
+    // Older schedules had a link typed by their creator: count that as required.
+    screenShareRequired: doc.screenShareRequired ?? !!doc.screenShareUrl,
+    screenShareUrl: doc.screenShareUrl ?? null,
+    techSupportRequired: doc.techSupportRequired ?? false,
+    linkedUids: linkedUidsOf(doc),
+    linked,
+    note: doc.note,
+    callerNote: doc.callerNote ?? null,
+    doneAt: doc.doneAt?.toISOString() ?? null,
+    profileManager,
+    mine: !!viewerId && doc.userId.equals(viewerId),
+  };
+}
+
+/** A random 10-digit schedule ID. The unique index catches the rare repeat; callers retry. */
+export function newScheduleUid(): string {
+  return String(randomInt(1_000_000_000, 10_000_000_000));
+}
+
+/** True for the error MongoDB gives when a schedule ID is already taken. */
+export function isDuplicateUid(err: unknown): boolean {
+  return err instanceof MongoServerError && err.code === 11000 && !!err.keyPattern?.uid;
+}
+
+/**
+ * Gives older schedules a 10-digit `uid`, once: those saved before IDs existed, and those with
+ * the earlier long (UUID) IDs. Links to an old ID are moved to the new one.
+ */
+async function withUids(docs: ScheduleDoc[]): Promise<ScheduleDoc[]> {
+  const outdated = docs.filter((doc) => !doc.uid || !SCHEDULE_UID_PATTERN.test(doc.uid));
+  if (outdated.length === 0) return docs;
+  const schedules = await getCollection<ScheduleDoc>("schedules");
+  for (const doc of outdated) {
+    const oldUid = doc.uid ?? null;
+    for (let attempt = 0; ; attempt++) {
+      const uid = newScheduleUid();
+      try {
+        // Only if it still has the old ID, so two requests can't give it different ones.
+        const result = await schedules.updateOne(oldUid ? { _id: doc._id, uid: oldUid } : { _id: doc._id, uid: { $exists: false } }, { $set: { uid } });
+        if (result.modifiedCount === 1) {
+          if (oldUid) {
+            await schedules.updateMany({ linkedUids: oldUid }, { $set: { "linkedUids.$": uid } });
+            await schedules.updateMany({ linkedUid: oldUid }, { $set: { linkedUid: uid } });
+          }
+          doc.uid = uid;
+        } else {
+          doc.uid = (await schedules.findOne({ _id: doc._id }))?.uid ?? uid;
+        }
+        break;
+      } catch (err) {
+        if (!isDuplicateUid(err) || attempt >= 4) throw err;
+      }
+    }
+    // Links in this batch to the old ID now point at the new one.
+    if (oldUid) {
+      for (const other of docs) {
+        if (other.linkedUid === oldUid) other.linkedUid = doc.uid;
+        other.linkedUids = other.linkedUids?.map((linked) => (linked === oldUid ? doc.uid : linked));
+      }
+    }
+  }
+  return docs;
+}
+
+/** Groups whose older schedules have been brought up to date (since this server started). */
+const groupsChecked = new Set<string>();
+
+/**
+ * Once per group per server: schedules made before groups existed join their creator's group,
+ * and any with old IDs get 10-digit ones (links to them may be in this group's calendar).
+ */
+async function upgradeOlderSchedules(groupId: ObjectId) {
+  if (groupsChecked.has(groupId.toHexString())) return;
+  const [users, schedules] = await Promise.all([getCollection<UserDoc>("users"), getCollection<ScheduleDoc>("schedules")]);
+  const members = await users.find({ groupId }, { projection: { _id: 1 } }).toArray();
+  if (members.length) {
+    await schedules.updateMany({ groupId: { $exists: false }, userId: { $in: members.map((m) => m._id) } }, { $set: { groupId } });
+  }
+  await withUids(await schedules.find({ groupId, uid: { $not: SCHEDULE_UID_PATTERN } }).toArray());
+  groupsChecked.add(groupId.toHexString());
+}
+
+/** Developers ("support" mode) only see schedules that need a tech supporter. */
+const TECH_SUPPORT = { techSupportRequired: true } as const;
+
+/**
+ * The Profile Managers who made `docs`, by user id (hex): their name, photo and color only.
+ * Colors follow the group's Profile Managers, oldest account first, so the first PM_COLORS of
+ * them never share one and each keeps theirs. Anyone else (e.g. a PM who left the group) gets a
+ * color from their id.
+ */
+async function ownersOf(groupId: ObjectId, docs: ScheduleDoc[]): Promise<Map<string, ScheduleOwner>> {
+  const ids = [...new Map(docs.map((d) => [d.userId.toHexString(), d.userId])).values()];
+  if (ids.length === 0) return new Map();
+  const users = await getCollection<UserDoc>("users");
+  const [found, groupPms] = await Promise.all([
+    users.find({ _id: { $in: ids }, "profile.completedAt": { $exists: true } }, { projection: { profile: 1 } }).toArray(),
+    users.find({ groupId, role: ROLES.profileManager }, { projection: { _id: 1 } }).sort({ createdAt: 1, _id: 1 }).toArray(),
+  ]);
+  const order = new Map(groupPms.map((u, i) => [u._id.toHexString(), i]));
+  const colorOf = (id: string) => ((order.get(id) ?? parseInt(id.slice(-6), 16)) % PM_COLORS) + 1;
+  return new Map(
+    found.map((u) => {
+      const id = u._id.toHexString();
+      const p = u.profile!;
+      return [id, { fullName: p.fullName, displayName: p.displayName, avatarUrl: avatarUrl(p.avatarId.toHexString()), color: colorOf(id) }];
+    }),
+  );
+}
+
+/**
+ * Schedules with their linked schedules (from the same group) and the Profile Manager who made
+ * them filled in. With `techSupportOnly` (Developers), only linked schedules that need a tech
+ * supporter are included.
+ */
+export async function withLinks(
+  groupId: ObjectId,
+  docs: ScheduleDoc[],
+  { techSupportOnly = false, viewerId = null }: ScheduleReadOptions = {},
+): Promise<Schedule[]> {
+  const uids = [...new Set(docs.flatMap(linkedUidsOf))];
+  const schedules = await getCollection<ScheduleDoc>("schedules");
+  const [linkedDocs, owners] = await Promise.all([
+    uids.length ? schedules.find({ groupId, uid: { $in: uids }, ...(techSupportOnly ? TECH_SUPPORT : {}) }).toArray() : [],
+    ownersOf(groupId, docs),
+  ]);
+  const byUid = new Map(
+    linkedDocs.map((d) => [d.uid, { uid: d.uid, title: d.title, start: d.start.toISOString(), end: d.end.toISOString() }]),
+  );
+  return docs.map((doc) =>
+    toSchedule(
+      doc,
+      linkedUidsOf(doc).flatMap((uid) => byUid.get(uid) ?? []),
+      owners.get(doc.userId.toHexString()) ?? null,
+      viewerId,
+    ),
+  );
+}
+
+/** A group's schedules that overlap [from, to), earliest first (see ScheduleReadOptions). */
+export async function listSchedules(groupId: ObjectId, from: Date, to: Date, options: ScheduleReadOptions = {}): Promise<Schedule[]> {
+  const { techSupportOnly = false } = options;
+  await upgradeOlderSchedules(groupId);
+  const schedules = await getCollection<ScheduleDoc>("schedules");
+  const docs = await schedules
+    .find({ groupId, start: { $lt: to }, end: { $gt: from }, ...(techSupportOnly ? TECH_SUPPORT : {}) })
+    .sort({ start: 1 })
+    .toArray();
+  return withLinks(groupId, await withUids(docs), options);
+}
+
+/**
+ * One of the group's schedules by its `uid`, or null (also for other groups' schedules, and for
+ * Developers, `techSupportOnly`, schedules that don't need a tech supporter).
+ */
+export async function findScheduleByUid(groupId: ObjectId, uid: string, options: ScheduleReadOptions = {}): Promise<Schedule | null> {
+  const { techSupportOnly = false } = options;
+  await upgradeOlderSchedules(groupId);
+  const schedules = await getCollection<ScheduleDoc>("schedules");
+  const doc = await schedules.findOne({ groupId, uid, ...(techSupportOnly ? TECH_SUPPORT : {}) });
+  return doc ? (await withLinks(groupId, [doc], options))[0] : null;
+}
+
+/** Which of `uids` are schedules in the group. */
+export async function findGroupUids(groupId: ObjectId, uids: string[]): Promise<Set<string>> {
+  if (uids.length === 0) return new Set();
+  const schedules = await getCollection<ScheduleDoc>("schedules");
+  const docs = await schedules.find({ groupId, uid: { $in: uids } }, { projection: { uid: 1 } }).toArray();
+  return new Set(docs.map((doc) => doc.uid));
+}
+
+/** The group's schedule document by database id (for checks in actions), or null. */
+export async function findScheduleDoc(groupId: ObjectId, scheduleId: ObjectId): Promise<ScheduleDoc | null> {
+  await upgradeOlderSchedules(groupId);
+  const schedules = await getCollection<ScheduleDoc>("schedules");
+  const doc = await schedules.findOne({ _id: scheduleId, groupId });
+  return doc ? (await withUids([doc]))[0] : null;
+}

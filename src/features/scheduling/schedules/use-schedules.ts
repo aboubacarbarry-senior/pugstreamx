@@ -1,0 +1,50 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { SCHEDULES_API_PATH } from "./constants";
+import type { Schedule } from "./types";
+
+/**
+ * A group calendar's schedules overlapping [from, to), loaded from /api/schedules (`extraQuery`
+ * is added to the request, e.g. "group=<id>" for super-admins) and reloaded when the range
+ * changes or `reload()` is called. While a new range loads, the previous
+ * schedules stay (they fall outside the new week, so nothing wrong is shown).
+ */
+export function useSchedules(range: { from: Date; to: Date } | null, extraQuery: string | null = null) {
+  const [loaded, setLoaded] = useState<{ key: string; schedules: Schedule[] } | null>(null);
+  const [failedKey, setFailedKey] = useState<string | null>(null);
+  const [version, setVersion] = useState(0);
+  const key = range
+    ? `from=${encodeURIComponent(range.from.toISOString())}&to=${encodeURIComponent(range.to.toISOString())}${extraQuery ? `&${extraQuery}` : ""}`
+    : null;
+
+  useEffect(() => {
+    if (!key) return;
+    const controller = new AbortController();
+    fetch(`${SCHEDULES_API_PATH}?${key}`, { signal: controller.signal, cache: "no-store" })
+      .then((res) => (res.ok ? (res.json() as Promise<{ schedules: Schedule[] }>) : Promise.reject(new Error(String(res.status)))))
+      .then((data) => {
+        setLoaded({ key, schedules: data.schedules });
+        setFailedKey(null);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setFailedKey(key);
+      });
+    return () => controller.abort();
+  }, [key, version]);
+
+  const reload = useCallback(() => setVersion((v) => v + 1), []);
+
+  /** Changes a loaded schedule right away (before the server confirms); `reload()` replaces it. */
+  const patch = useCallback((id: string, changes: Partial<Schedule>) => {
+    setLoaded((current) => current && { ...current, schedules: current.schedules.map((s) => (s.id === id ? { ...s, ...changes } : s)) });
+  }, []);
+
+  return {
+    schedules: loaded?.schedules ?? [],
+    loading: loaded?.key !== key && failedKey !== key,
+    failed: failedKey !== null && failedKey === key,
+    reload,
+    patch,
+  };
+}
